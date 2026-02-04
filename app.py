@@ -54,6 +54,165 @@ def save_line_chart(
     return True
 
 
+def save_combined_chart(
+    combined: pd.DataFrame,
+    out_png: str,
+    days: int = 365,
+) -> bool:
+    """Create a single-panel chart with all indicators overlaid."""
+    if combined.empty or "date" not in combined.columns:
+        return False
+
+    df = combined.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date")
+
+    # Filter to recent N days
+    cutoff = df["date"].max() - pd.Timedelta(days=days)
+    df = df[df["date"] >= cutoff]
+
+    if df.empty:
+        return False
+
+    fig, ax1 = plt.subplots(figsize=(14, 5))
+
+    # Left Y-axis: VIX, AAII, RSI, Margin (0-80 scale)
+    # VIX - blue line
+    if "vix" in df.columns and df["vix"].notna().any():
+        d = df[["date", "vix"]].dropna()
+        ax1.plot(d["date"], d["vix"], label="VIX", color="blue", linewidth=1.5)
+
+    # AAII Bullish - red scatter
+    if "AAII_Bullish" in df.columns and df["AAII_Bullish"].notna().any():
+        d = df[["date", "AAII_Bullish"]].dropna()
+        ax1.scatter(d["date"], d["AAII_Bullish"], label="AAII_Bullish", color="red", s=15, alpha=0.7)
+
+    # Margin - yellow/orange scatter
+    if "Margin" in df.columns and df["Margin"].notna().any():
+        d = df[["date", "Margin"]].dropna()
+        ax1.scatter(d["date"], d["Margin"], label="Margin", color="orange", s=15, alpha=0.7, marker="s")
+
+    # RSI - green line
+    if "RSI" in df.columns and df["RSI"].notna().any():
+        d = df[["date", "RSI"]].dropna()
+        ax1.plot(d["date"], d["RSI"], label="RSI", color="green", linewidth=1.5)
+
+    ax1.set_ylabel("VIX / AAII / RSI / Margin")
+    ax1.set_ylim(0, 80)
+    ax1.set_xlabel("")
+    ax1.grid(True, alpha=0.3)
+
+    # Right Y-axis: CFTC Net (inverted, 0 to -200000)
+    ax2 = ax1.twinx()
+    if "CFTC_Net" in df.columns and df["CFTC_Net"].notna().any():
+        d = df[["date", "CFTC_Net"]].dropna()
+        ax2.scatter(d["date"], d["CFTC_Net"], label="CFTC_Net", color="darkorange", s=15, alpha=0.7)
+        ax2.set_ylabel("CFTC_Net", color="darkorange")
+        ax2.tick_params(axis="y", labelcolor="darkorange")
+        # Set y-limits to show negative values prominently
+        min_val = d["CFTC_Net"].min()
+        max_val = d["CFTC_Net"].max()
+        ax2.set_ylim(min(min_val * 1.1, -200000), max(max_val * 1.1, 0))
+
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper center", ncol=5, bbox_to_anchor=(0.5, 1.12))
+
+    # Format x-axis dates
+    ax1.xaxis.set_major_formatter(plt.matplotlib.dates.DateFormatter("%Y/%m/%d"))
+    fig.autofmt_xdate()
+
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=160)
+    plt.close()
+    return True
+
+
+def build_combined_df(
+    vix_df: pd.DataFrame | None,
+    aaii_df: pd.DataFrame | None,
+    cftc_df: pd.DataFrame | None,
+    margin_df: pd.DataFrame | None,
+    rsi_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Merge all indicator DataFrames by date."""
+    # Extract CFTC S&P 500 net position first
+    cftc_sp500 = extract_cftc_sp500_net(cftc_df) if cftc_df is not None else None
+
+    # Start with a date range
+    all_dates: set[str] = set()
+
+    def extract_dates(df: pd.DataFrame | None, date_col: str = "date") -> None:
+        if df is None or df.empty:
+            return
+        col = None
+        for c in df.columns:
+            if "date" in str(c).lower():
+                col = c
+                break
+        if col is None:
+            return
+        dates = pd.to_datetime(df[col], errors="coerce").dropna()
+        all_dates.update(d.strftime("%Y-%m-%d") for d in dates)
+
+    extract_dates(vix_df)
+    extract_dates(aaii_df)
+    extract_dates(cftc_sp500)
+    extract_dates(margin_df)
+    extract_dates(rsi_df)
+
+    if not all_dates:
+        return pd.DataFrame()
+
+    combined = pd.DataFrame({"date": sorted(all_dates)})
+    combined["date"] = pd.to_datetime(combined["date"])
+
+    def merge_col(df: pd.DataFrame | None, src_col: str, dst_col: str) -> None:
+        nonlocal combined
+        if df is None or df.empty:
+            return
+        date_col = None
+        for c in df.columns:
+            if "date" in str(c).lower():
+                date_col = c
+                break
+        if date_col is None or src_col not in df.columns:
+            return
+        tmp = df[[date_col, src_col]].copy()
+        tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+        tmp = tmp.dropna(subset=[date_col])
+        tmp = tmp.rename(columns={date_col: "date", src_col: dst_col})
+        combined = combined.merge(tmp, on="date", how="left")
+
+    # VIX
+    merge_col(vix_df, "vix", "vix")
+
+    # AAII
+    if aaii_df is not None:
+        for src, dst in [("bullish", "AAII_Bullish"), ("neutral", "AAII_Neutral"), ("bearish", "AAII_Bearish")]:
+            for c in aaii_df.columns:
+                if src in str(c).lower():
+                    merge_col(aaii_df, c, dst)
+                    break
+
+    # CFTC - use pre-extracted S&P 500 net position
+    merge_col(cftc_sp500, "CFTC_Net", "CFTC_Net")
+
+    # Margin
+    if margin_df is not None:
+        for c in margin_df.columns:
+            if "margin" in str(c).lower() or "balance" in str(c).lower():
+                merge_col(margin_df, c, "Margin")
+                break
+
+    # RSI
+    if rsi_df is not None:
+        merge_col(rsi_df, "RSI14", "RSI")
+
+    return combined.sort_values("date")
+
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0)
@@ -64,10 +223,30 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     return 100 - (100 / (1 + rs))
 
 
-def slack_notify(webhook_url: str, text: str) -> None:
+def slack_notify(
+    webhook_url: str,
+    text: str,
+    image_urls: list[str] | None = None,
+) -> None:
     if not webhook_url:
         return
-    r = requests.post(webhook_url, json={"text": text}, timeout=20)
+
+    # Build payload with Block Kit if images provided
+    if image_urls:
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        ]
+        for url in image_urls:
+            blocks.append({
+                "type": "image",
+                "image_url": url,
+                "alt_text": "Chart",
+            })
+        payload = {"blocks": blocks, "text": text}  # text is fallback
+    else:
+        payload = {"text": text}
+
+    r = requests.post(webhook_url, json=payload, timeout=20)
     r.raise_for_status()
 
 
@@ -138,6 +317,38 @@ def fetch_vix_fred() -> pd.DataFrame:
 def fetch_cftc_finfutwk() -> pd.DataFrame:
     url = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
     return fetch_text_as_csv(url, header=None)
+
+
+def extract_cftc_sp500_net(cftc_df: pd.DataFrame) -> pd.DataFrame:
+    """Extract S&P 500 net non-commercial position from CFTC data.
+    
+    CFTC FinFut format (no header):
+    - Column 0: Contract name
+    - Column 2: Date (YYYY-MM-DD)
+    - Column 8: Non-commercial Long
+    - Column 9: Non-commercial Short
+    Net = Long - Short
+    """
+    if cftc_df.empty:
+        return pd.DataFrame(columns=["date", "CFTC_Net"])
+    
+    # Filter for S&P 500 Consolidated rows
+    mask = cftc_df[0].str.contains("S&P 500 Consolidated", case=False, na=False)
+    sp500 = cftc_df[mask].copy()
+    
+    if sp500.empty:
+        return pd.DataFrame(columns=["date", "CFTC_Net"])
+    
+    # Extract date and positions
+    result = pd.DataFrame()
+    result["date"] = pd.to_datetime(sp500[2], errors="coerce")
+    
+    # Columns 8 and 9 are non-commercial long and short
+    long_col = pd.to_numeric(sp500[8], errors="coerce")
+    short_col = pd.to_numeric(sp500[9], errors="coerce")
+    result["CFTC_Net"] = long_col.values - short_col.values
+    
+    return result.dropna(subset=["date"]).sort_values("date")
 
 
 def _detect_date_col(columns: list[str]) -> str | None:
@@ -237,23 +448,32 @@ def main() -> None:
     slack_webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
     aaii_mode = os.environ.get("AAII_MODE", "mirror")
     aaii_manual_file = os.environ.get("AAII_MANUAL_FILE", os.path.join(INPUT_DIR, "aaii.xlsx"))
+    # GitHub Pages base URL for chart images
+    chart_base_url = os.environ.get("CHART_BASE_URL", "")
 
     default_targets = "^spx,NIKKEI_OFFICIAL,fx.f,acwi.us"
     targets = [s.strip() for s in os.environ.get("RSI_TARGETS", default_targets).split(",") if s.strip()]
 
+    # Store DataFrames for combined output
+    vix_df: pd.DataFrame | None = None
+    aaii_df: pd.DataFrame | None = None
+    cftc_df: pd.DataFrame | None = None
+    margin_df: pd.DataFrame | None = None
+    rsi_df: pd.DataFrame | None = None
+
     # ---- VIX ----
-    vix = fetch_vix_fred()
-    save_csv(vix, os.path.join(DATA_DIR, "vix.csv"))
-    save_line_chart(vix, "date", "vix", "VIX (FRED VIXCLS)", os.path.join(CHART_DIR, "vix.png"))
-    vix_dates = pd.to_datetime(vix["date"], errors="coerce")
+    vix_df = fetch_vix_fred()
+    save_csv(vix_df, os.path.join(DATA_DIR, "vix.csv"))
+    save_line_chart(vix_df, "date", "vix", "VIX (FRED VIXCLS)", os.path.join(CHART_DIR, "vix.png"))
+    vix_dates = pd.to_datetime(vix_df["date"], errors="coerce")
     vix_max = vix_dates.max()
     vix_key = str(vix_max.date()) if pd.notna(vix_max) else "unknown"
     vix_updated = changed_since_last_run("vix", vix_key)
 
     # ---- CFTC ----
-    cftc = fetch_cftc_finfutwk()
-    save_csv(cftc, os.path.join(DATA_DIR, "cftc_finfutwk_raw.csv"))
-    cftc_key = str(len(cftc))
+    cftc_df = fetch_cftc_finfutwk()
+    save_csv(cftc_df, os.path.join(DATA_DIR, "cftc_finfutwk_raw.csv"))
+    cftc_key = str(len(cftc_df))
     cftc_updated = changed_since_last_run("cftc", cftc_key)
 
     # ---- J-Quants weekly margin ----
@@ -262,12 +482,12 @@ def main() -> None:
     j_token = os.environ.get("JQUANTS_TOKEN", "")
     if j_token and os.environ.get("JQUANTS_MARGIN_API_URL", ""):
         try:
-            margin = fetch_jquants_weekly_margin(j_token)
-            save_csv(margin, os.path.join(DATA_DIR, "margin_weekly.csv"))
-            key = str(len(margin))
+            margin_df = fetch_jquants_weekly_margin(j_token)
+            save_csv(margin_df, os.path.join(DATA_DIR, "margin_weekly.csv"))
+            key = str(len(margin_df))
             for cand in ["Date", "date", "EndDate", "end_date", "TradeDate", "trade_date"]:
-                if cand in margin.columns:
-                    max_date = pd.to_datetime(margin[cand], errors="coerce").max()
+                if cand in margin_df.columns:
+                    max_date = pd.to_datetime(margin_df[cand], errors="coerce").max()
                     key = str(max_date.date()) if pd.notna(max_date) else "unknown"
                     break
             margin_updated = changed_since_last_run("margin", key)
@@ -279,12 +499,12 @@ def main() -> None:
     aaii_updated = False
     aaii_note = "AAII: 未取得"
     try:
-        aaii, aaii_source = fetch_aaii(aaii_mode, aaii_manual_file)
-        save_csv(aaii, os.path.join(DATA_DIR, "aaii.csv"))
-        key = str(len(aaii))
-        for cand in aaii.columns:
+        aaii_df, aaii_source = fetch_aaii(aaii_mode, aaii_manual_file)
+        save_csv(aaii_df, os.path.join(DATA_DIR, "aaii.csv"))
+        key = str(len(aaii_df))
+        for cand in aaii_df.columns:
             if "date" in str(cand).lower():
-                max_date = pd.to_datetime(aaii[cand], errors="coerce").max()
+                max_date = pd.to_datetime(aaii_df[cand], errors="coerce").max()
                 key = str(max_date.date()) if pd.notna(max_date) else "unknown"
                 break
         aaii_updated = changed_since_last_run("aaii", key)
@@ -294,6 +514,7 @@ def main() -> None:
 
     # ---- RSI ----
     rsi_lines: list[str] = []
+    primary_rsi_df: pd.DataFrame | None = None
     for sym in targets:
         try:
             if sym.upper() == NIKKEI_OFFICIAL_SYMBOL:
@@ -318,10 +539,22 @@ def main() -> None:
             save_csv(px, out_csv)
             save_line_chart(px, "date", "RSI14", f"RSI14 {label}", out_png)
 
+            # Use first target (^spx) as primary RSI for combined chart
+            if primary_rsi_df is None:
+                primary_rsi_df = px[["date", "RSI14"]].copy()
+
             last = px.dropna(subset=["RSI14"]).iloc[-1]
             rsi_lines.append(f"RSI {label}: {float(last['RSI14']):.1f}")
         except Exception as e:
             rsi_lines.append(f"RSI {sym}: 失敗({e.__class__.__name__})")
+
+    rsi_df = primary_rsi_df
+
+    # ---- Combined output ----
+    combined = build_combined_df(vix_df, aaii_df, cftc_df, margin_df, rsi_df)
+    if not combined.empty:
+        save_csv(combined, os.path.join(DATA_DIR, "combined.csv"))
+        save_combined_chart(combined, os.path.join(CHART_DIR, "combined.png"))
 
     # ---- Slack ----
     jst = timezone(timedelta(hours=9))
@@ -338,7 +571,15 @@ def main() -> None:
     ]
     message = "\n".join(lines)
     print(message)
-    slack_notify(slack_webhook, message)
+
+    # Build image URLs if base URL is configured
+    image_urls: list[str] = []
+    if chart_base_url:
+        image_urls = [
+            f"{chart_base_url.rstrip('/')}/charts/combined.png",
+        ]
+
+    slack_notify(slack_webhook, message, image_urls if image_urls else None)
 
 
 if __name__ == "__main__":
