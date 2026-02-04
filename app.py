@@ -112,7 +112,27 @@ def fetch_stooq(symbol: str) -> pd.DataFrame:
 def fetch_vix_fred() -> pd.DataFrame:
     url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=VIXCLS"
     df = fetch_csv(url, na_values=["."])
-    return df.rename(columns={"DATE": "date", "VIXCLS": "vix"})
+
+    # Detect date column (case-insensitive)
+    date_col = _detect_date_col(list(df.columns))
+    if not date_col:
+        raise RuntimeError(f"VIX FRED CSV date column not found: {list(df.columns)}")
+
+    # Detect VIX value column (VIXCLS or similar)
+    vix_col = None
+    for c in df.columns:
+        if "vix" in str(c).lower():
+            vix_col = c
+            break
+    if not vix_col:
+        # Fallback: use the non-date column
+        non_date_cols = [c for c in df.columns if c != date_col]
+        if non_date_cols:
+            vix_col = non_date_cols[0]
+    if not vix_col:
+        raise RuntimeError(f"VIX FRED CSV value column not found: {list(df.columns)}")
+
+    return df.rename(columns={date_col: "date", vix_col: "vix"})
 
 
 def fetch_cftc_finfutwk() -> pd.DataFrame:
