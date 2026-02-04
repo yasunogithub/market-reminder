@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -15,6 +16,9 @@ import matplotlib.pyplot as plt
 DATA_DIR = "data"
 CHART_DIR = "charts"
 INPUT_DIR = "inputs"
+
+# Extended RSI targets for comprehensive market coverage
+DEFAULT_RSI_TARGETS = "^spx,NIKKEI_OFFICIAL,^ndq,^dji,fx.f,acwi.us,spy.us,qqq.us,iwm.us"
 
 NIKKEI_OFFICIAL_SYMBOL = "NIKKEI_OFFICIAL"
 
@@ -319,6 +323,39 @@ def fetch_cftc_finfutwk() -> pd.DataFrame:
     return fetch_text_as_csv(url, header=None)
 
 
+def fetch_cftc_historical(start_year: int = 2006, end_year: int | None = None) -> pd.DataFrame:
+    """Fetch historical CFTC Financial Futures data from yearly archives.
+
+    CFTC provides yearly archives at:
+    https://www.cftc.gov/files/dea/history/fin_fut_txt_{year}.zip
+
+    Returns combined DataFrame of all available historical data.
+    """
+    if end_year is None:
+        end_year = datetime.now().year + 1
+
+    all_dfs = []
+    for year in range(start_year, end_year):
+        url = f"https://www.cftc.gov/files/dea/history/fin_fut_txt_{year}.zip"
+        try:
+            r = requests.get(url, timeout=60)
+            if r.status_code != 200:
+                continue
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                for name in z.namelist():
+                    if name.endswith('.txt'):
+                        with z.open(name) as f:
+                            df = pd.read_csv(f)
+                            all_dfs.append(df)
+                            print(f"  CFTC {year}: {len(df)} rows")
+        except Exception as e:
+            print(f"  CFTC {year}: failed ({e.__class__.__name__})")
+
+    if all_dfs:
+        return pd.concat(all_dfs, ignore_index=True)
+    return pd.DataFrame()
+
+
 def extract_cftc_sp500_net(cftc_df: pd.DataFrame) -> pd.DataFrame:
     """Extract S&P 500 net non-commercial position from CFTC data.
     
@@ -451,8 +488,14 @@ def main() -> None:
     # GitHub Pages base URL for chart images
     chart_base_url = os.environ.get("CHART_BASE_URL", "")
 
-    default_targets = "^spx,NIKKEI_OFFICIAL,fx.f,acwi.us"
-    targets = [s.strip() for s in os.environ.get("RSI_TARGETS", default_targets).split(",") if s.strip()]
+    targets = [s.strip() for s in os.environ.get("RSI_TARGETS", DEFAULT_RSI_TARGETS).split(",") if s.strip()]
+
+    # Store DataFrames for combined output
+    vix_df: pd.DataFrame | None = None
+    aaii_df: pd.DataFrame | None = None
+    cftc_df: pd.DataFrame | None = None
+    margin_df: pd.DataFrame | None = None
+    rsi_df: pd.DataFrame | None = None
 
     # Store DataFrames for combined output
     vix_df: pd.DataFrame | None = None
@@ -475,6 +518,15 @@ def main() -> None:
     save_csv(cftc_df, os.path.join(DATA_DIR, "cftc_finfutwk_raw.csv"))
     cftc_key = str(len(cftc_df))
     cftc_updated = changed_since_last_run("cftc", cftc_key)
+
+    # ---- CFTC Historical (fetch once if not exists) ----
+    cftc_hist_path = os.path.join(DATA_DIR, "cftc_finfut_historical.csv")
+    if not os.path.exists(cftc_hist_path) or os.environ.get("FORCE_CFTC_HISTORICAL"):
+        print("Fetching CFTC historical data (2006-present)...")
+        cftc_hist = fetch_cftc_historical(2006)
+        if not cftc_hist.empty:
+            save_csv(cftc_hist, cftc_hist_path)
+            print(f"  CFTC Historical: {len(cftc_hist)} rows saved")
 
     # ---- J-Quants weekly margin ----
     margin_updated = False
