@@ -582,5 +582,73 @@ def main() -> None:
     slack_notify(slack_webhook, message, image_urls if image_urls else None)
 
 
+def notify_only() -> None:
+    """Send Slack notification using saved state (for use after commit)."""
+    import json
+
+    slack_webhook = os.environ.get("SLACK_WEBHOOK_URL", "")
+    chart_base_url = os.environ.get("CHART_BASE_URL", "")
+
+    if not slack_webhook:
+        print("SLACK_WEBHOOK_URL not set, skipping notification")
+        return
+
+    # Load saved state
+    state_file = os.path.join(DATA_DIR, "_state.json")
+    state: dict[str, str] = {}
+    if os.path.exists(state_file):
+        with open(state_file, encoding="utf-8") as f:
+            state = json.load(f)
+
+    # Build message from state
+    jst = timezone(timedelta(hours=9))
+    now_jst = datetime.now(timezone.utc).astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
+
+    vix_key = state.get("vix", "unknown")
+    cftc_key = state.get("cftc", "unknown")
+    aaii_key = state.get("aaii", "unknown")
+    margin_key = state.get("margin", "")
+
+    # Read RSI values from saved CSVs
+    rsi_lines: list[str] = []
+    default_targets = "^spx,NIKKEI_OFFICIAL,fx.f,acwi.us"
+    targets = [s.strip() for s in os.environ.get("RSI_TARGETS", default_targets).split(",") if s.strip()]
+    for sym in targets:
+        safe_sym = _safe_symbol(sym)
+        csv_path = os.path.join(DATA_DIR, f"{safe_sym}_rsi.csv")
+        if os.path.exists(csv_path):
+            try:
+                df = pd.read_csv(csv_path)
+                last = df.dropna(subset=["RSI14"]).iloc[-1]
+                label = "Nikkei 225 (Official)" if sym.upper() == NIKKEI_OFFICIAL_SYMBOL else sym
+                rsi_lines.append(f"RSI {label}: {float(last['RSI14']):.1f}")
+            except Exception:
+                pass
+
+    lines = [
+        f"Daily Market Reminder ({now_jst})",
+        f"VIX: {vix_key}",
+        f"AAII: {aaii_key}" if aaii_key != "unknown" else "AAII: -",
+        f"CFTC: {cftc_key}",
+        f"Margin: {margin_key}" if margin_key else "Margin: -",
+        " / ".join(rsi_lines) if rsi_lines else "RSI: -",
+    ]
+    message = "\n".join(lines)
+    print(message)
+
+    # Build image URLs
+    image_urls: list[str] = []
+    if chart_base_url:
+        image_urls = [
+            f"{chart_base_url.rstrip('/')}/charts/combined.png",
+        ]
+
+    slack_notify(slack_webhook, message, image_urls if image_urls else None)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--notify-only" in sys.argv:
+        notify_only()
+    else:
+        main()
