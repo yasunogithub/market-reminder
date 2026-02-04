@@ -605,9 +605,6 @@ def notify_only() -> None:
     now_jst = datetime.now(timezone.utc).astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
 
     vix_key = state.get("vix", "unknown")
-    cftc_key = state.get("cftc", "unknown")
-    aaii_key = state.get("aaii", "unknown")
-    margin_key = state.get("margin", "")
 
     # Read RSI values from saved CSVs
     rsi_lines: list[str] = []
@@ -625,13 +622,30 @@ def notify_only() -> None:
             except Exception:
                 pass
 
+    # Read latest values from combined.csv
+    combined_path = os.path.join(DATA_DIR, "combined.csv")
+    vix_val = "-"
+    cftc_val = "-"
+    if os.path.exists(combined_path):
+        try:
+            df = pd.read_csv(combined_path)
+            df = df.dropna(subset=["date"]).sort_values("date")
+            if "vix" in df.columns:
+                last_vix = df.dropna(subset=["vix"]).iloc[-1] if df["vix"].notna().any() else None
+                if last_vix is not None:
+                    vix_val = f"{float(last_vix['vix']):.2f}"
+            if "CFTC_Net" in df.columns:
+                last_cftc = df.dropna(subset=["CFTC_Net"]).iloc[-1] if df["CFTC_Net"].notna().any() else None
+                if last_cftc is not None:
+                    cftc_val = f"{int(last_cftc['CFTC_Net']):,}"
+        except Exception:
+            pass
+
     lines = [
         f"Daily Market Reminder ({now_jst})",
-        f"VIX: {vix_key}",
-        f"AAII: {aaii_key}" if aaii_key != "unknown" else "AAII: -",
-        f"CFTC: {cftc_key}",
-        f"Margin: {margin_key}" if margin_key else "Margin: -",
+        f"VIX: {vix_val} ({vix_key})",
         " / ".join(rsi_lines) if rsi_lines else "RSI: -",
+        f"CFTC Net: {cftc_val}",
     ]
     message = "\n".join(lines)
     print(message)
