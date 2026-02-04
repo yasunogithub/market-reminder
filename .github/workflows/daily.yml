@@ -1,0 +1,34 @@
+name: market-reminder
+
+on:
+  schedule:
+    - cron: "0 22 * * *" # UTC 22:00 = JST 07:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python app.py
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          AAII_MODE: ${{ secrets.AAII_MODE }}
+          AAII_MANUAL_FILE: ${{ secrets.AAII_MANUAL_FILE }}
+          RSI_TARGETS: ${{ secrets.RSI_TARGETS }}
+          JQUANTS_TOKEN: ${{ secrets.JQUANTS_TOKEN }}
+          JQUANTS_MARGIN_API_URL: ${{ secrets.JQUANTS_MARGIN_API_URL }}
+      - name: Commit outputs
+        run: |
+          git config user.name "market-bot"
+          git config user.email "market-bot@users.noreply.github.com"
+          git add data charts || true
+          git commit -m "daily update" || exit 0
+          git push
