@@ -475,6 +475,62 @@ def fetch_aaii_from_manual_excel(path: str) -> pd.DataFrame:
     return pd.read_excel(path)
 
 
+
+def fetch_jpx_margin() -> pd.DataFrame:
+    """Fetch margin trading balance from JPX website."""
+    import io
+    from datetime import timedelta
+
+    base_url = "https://www.jpx.co.jp/markets/statistics-equities/margin/tvdivq0000001rk9-att/mtseisan{date}00.xls"
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+
+    # Try recent dates (published every Wednesday)
+    today = datetime.now()
+    results = []
+
+    for days_back in range(0, 30):
+        check_date = today - timedelta(days=days_back)
+        date_str = check_date.strftime("%Y%m%d")
+        url = base_url.format(date=date_str)
+
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            if r.status_code == 200:
+                # Parse Excel
+                df = pd.read_excel(io.BytesIO(r.content), header=None)
+
+                # Find the row with "二市場計" (Total)
+                for i, row in df.iterrows():
+                    row_str = " ".join(str(v) for v in row.values if pd.notna(v))
+                    if "二市場計" in row_str or "Total" in row_str:
+                        # Next row has 株数 (shares) data
+                        if i + 1 < len(df):
+                            data_row = df.iloc[i]
+                            # Find numeric columns (売残高, 買残高)
+                            # Typically: col 3 = 売残高, col 5 = 買残高
+                            try:
+                                short_vol = pd.to_numeric(df.iloc[i, 3], errors="coerce")
+                                long_vol = pd.to_numeric(df.iloc[i, 5], errors="coerce")
+                                if pd.notna(short_vol) and pd.notna(long_vol):
+                                    results.append({
+                                        "date": check_date.strftime("%Y-%m-%d"),
+                                        "margin_long": int(long_vol),
+                                        "margin_short": int(short_vol),
+                                        "margin_balance": int(long_vol - short_vol),
+                                    })
+                                    break
+                            except Exception:
+                                pass
+                if results:
+                    break
+        except Exception:
+            continue
+
+    if not results:
+        raise RuntimeError("JPX margin data not found")
+
+    return pd.DataFrame(results)
+
 def fetch_aaii(mode: str, manual_path: str) -> tuple[pd.DataFrame, str]:
     mode = (mode or "mirror").lower()
     if mode == "mirror":
@@ -539,22 +595,16 @@ def main() -> None:
 
     # ---- J-Quants weekly margin ----
     margin_updated = False
-    margin_note = "信用残: 未設定"
-    j_api_key = os.environ.get("JQUANTS_API_KEY", "")
-    if j_api_key:
-        try:
-            margin_df = fetch_jquants_weekly_margin(j_api_key)
-            save_csv(margin_df, os.path.join(DATA_DIR, "margin_weekly.csv"))
-            key = str(len(margin_df))
-            for cand in ["Date", "date", "EndDate", "end_date", "TradeDate", "trade_date"]:
-                if cand in margin_df.columns:
-                    max_date = pd.to_datetime(margin_df[cand], errors="coerce").max()
-                    key = str(max_date.date()) if pd.notna(max_date) else "unknown"
-                    break
+    margin_note = "信用残: -"
+    try:
+        margin_df = fetch_jpx_margin()
+        save_csv(margin_df, os.path.join(DATA_DIR, "margin_jpx.csv"))
+        if "date" in margin_df.columns:
+            key = str(margin_df["date"].iloc[0])
             margin_updated = changed_since_last_run("margin", key)
             margin_note = f"信用残: {'更新あり' if margin_updated else '更新なし'} ({key})"
-        except Exception as e:
-            margin_note = f"信用残: 取得失敗 ({e.__class__.__name__})"
+    except Exception as e:
+        margin_note = f"信用残: 取得失敗 ({e.__class__.__name__})"
 
     # ---- AAII ----
     aaii_updated = False
@@ -663,56 +713,137 @@ def notify_only() -> None:
 
     # Build message from state
     jst = timezone(timedelta(hours=9))
-    now_jst = datetime.now(timezone.utc).astimezone(jst).strftime("%Y-%m-%d %H:%M JST")
+    now_jst = datetime.now(timezone.utc).astimezone(jst).strftime("%m/%d %H:%M")
 
-    vix_key = state.get("vix", "unknown")
+    # Read latest values from data files
+    vix_val = 0.0
+    aaii_bull = 0.0
+    aaii_bear = 0.0
+    cftc_net = 0
+    margin_balance = 0
+    rsi_val = 50.0
 
-    # Read RSI values from saved CSVs
-    rsi_lines: list[str] = []
-    default_targets = "^spx,NIKKEI_OFFICIAL,fx.f,acwi.us"
-    targets = [s.strip() for s in os.environ.get("RSI_TARGETS", default_targets).split(",") if s.strip()]
-    for sym in targets:
-        safe_sym = _safe_symbol(sym)
-        csv_path = os.path.join(DATA_DIR, f"{safe_sym}_rsi.csv")
-        if os.path.exists(csv_path):
-            try:
-                df = pd.read_csv(csv_path)
-                last = df.dropna(subset=["RSI14"]).iloc[-1]
-                label = "Nikkei 225 (Official)" if sym.upper() == NIKKEI_OFFICIAL_SYMBOL else sym
-                rsi_lines.append(f"RSI {label}: {float(last['RSI14']):.1f}")
-            except Exception:
-                pass
+    # VIX
+    vix_path = os.path.join(DATA_DIR, "vix.csv")
+    if os.path.exists(vix_path):
+        try:
+            df = pd.read_csv(vix_path)
+            vix_val = float(df.dropna(subset=["vix"]).iloc[-1]["vix"])
+        except Exception:
+            pass
 
-    # Read latest values from combined.csv
+    # AAII
+    aaii_path = os.path.join(DATA_DIR, "aaii.csv")
+    if os.path.exists(aaii_path):
+        try:
+            df = pd.read_csv(aaii_path)
+            last = df.iloc[0]  # Latest is first row
+            aaii_bull = float(last.get("bullish", 0))
+            aaii_bear = float(last.get("bearish", 0))
+        except Exception:
+            pass
+
+    # CFTC
     combined_path = os.path.join(DATA_DIR, "combined.csv")
-    vix_val = "-"
-    aaii_val = "-"
-    cftc_val = "-"
     if os.path.exists(combined_path):
         try:
             df = pd.read_csv(combined_path)
             df = df.dropna(subset=["date"]).sort_values("date")
-            if "vix" in df.columns and df["vix"].notna().any():
-                last_vix = df.dropna(subset=["vix"]).iloc[-1]
-                vix_val = f"{float(last_vix['vix']):.2f}"
-            if "AAII_Bullish" in df.columns and df["AAII_Bullish"].notna().any():
-                last_aaii = df.dropna(subset=["AAII_Bullish"]).iloc[-1]
-                bull = float(last_aaii["AAII_Bullish"])
-                bear = float(last_aaii.get("AAII_Bearish", 0)) if "AAII_Bearish" in df.columns else 0
-                aaii_val = f"Bull {bull:.1f}% / Bear {bear:.1f}%"
             if "CFTC_Net" in df.columns and df["CFTC_Net"].notna().any():
-                last_cftc = df.dropna(subset=["CFTC_Net"]).iloc[-1]
-                cftc_val = f"{int(last_cftc['CFTC_Net']):,}"
+                cftc_net = int(df.dropna(subset=["CFTC_Net"]).iloc[-1]["CFTC_Net"])
         except Exception:
             pass
 
+    # Margin
+    margin_path = os.path.join(DATA_DIR, "margin_jpx.csv")
+    if os.path.exists(margin_path):
+        try:
+            df = pd.read_csv(margin_path)
+            margin_balance = int(df.iloc[0].get("margin_balance", 0))
+        except Exception:
+            pass
+
+    # Read RSI from CSV if not in combined
+    if rsi_val == 50.0:
+        csv_path = os.path.join(DATA_DIR, "spx_rsi.csv")
+        if os.path.exists(csv_path):
+            try:
+                df = pd.read_csv(csv_path)
+                rsi_val = float(df.dropna(subset=["RSI14"]).iloc[-1]["RSI14"])
+            except Exception:
+                pass
+
+    # Weather-like indicators
+    def get_vix_weather(vix: float) -> str:
+        if vix < 15:
+            return "☀️ 快晴"
+        elif vix < 20:
+            return "🌤️ 晴れ"
+        elif vix < 25:
+            return "⛅ くもり"
+        elif vix < 30:
+            return "🌧️ 雨"
+        elif vix < 40:
+            return "⛈️ 荒れ模様"
+        else:
+            return "🌪️ 暴風雨"
+
+    def get_sentiment_weather(bull: float, bear: float) -> str:
+        spread = bull - bear
+        if spread > 20:
+            return "😊 楽観"
+        elif spread > 10:
+            return "🙂 やや楽観"
+        elif spread > -10:
+            return "😐 中立"
+        elif spread > -20:
+            return "😟 やや悲観"
+        else:
+            return "😰 悲観"
+
+    def get_rsi_indicator(rsi: float) -> str:
+        if rsi >= 70:
+            return "🔥 過熱"
+        elif rsi >= 60:
+            return "🌡️ やや過熱"
+        elif rsi <= 30:
+            return "❄️ 売られすぎ"
+        elif rsi <= 40:
+            return "🌬️ やや弱い"
+        else:
+            return "🌡️ 適温"
+
+    def get_external_pressure(cftc: int) -> str:
+        if cftc < -150000:
+            return "💨💨💨 外圧強い"
+        elif cftc < -100000:
+            return "💨💨 外圧やや強い"
+        elif cftc < -50000:
+            return "💨 外圧あり"
+        elif cftc > 50000:
+            return "🌬️ 買い越し"
+        else:
+            return "〜 穏やか"
+
+    vix_weather = get_vix_weather(vix_val)
+    sentiment = get_sentiment_weather(aaii_bull, aaii_bear)
+    rsi_indicator = get_rsi_indicator(rsi_val)
+    pressure = get_external_pressure(cftc_net)
+
     lines = [
-        f"Daily Market Reminder ({now_jst})",
-        f"VIX: {vix_val} ({vix_key})",
-        f"AAII: {aaii_val}",
-        f"CFTC Net: {cftc_val}",
-        " / ".join(rsi_lines) if rsi_lines else "RSI: -",
+        "<!here>",
+        f"📊 マーケット天気予報 ({now_jst})",
+        "",
+        f"🌡️ VIX: {vix_val:.1f} → {vix_weather}",
+        f"👥 センチメント: {sentiment} (強気{aaii_bull:.0f}%/弱気{aaii_bear:.0f}%)",
+        f"📈 RSI: {rsi_val:.1f} → {rsi_indicator}",
+        f"🌊 CFTC: {cftc_net:,} → {pressure}",
     ]
+
+    if margin_balance > 0:
+        margin_ratio = margin_balance / 1000000  # 百万株単位
+        lines.append(f"💰 信用残: {margin_ratio:.1f}M株")
+
     message = "\n".join(lines)
     print(message)
 
