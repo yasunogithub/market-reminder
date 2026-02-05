@@ -576,7 +576,9 @@ def main() -> None:
     # GitHub Pages base URL for chart images
     chart_base_url = os.environ.get("CHART_BASE_URL", "")
 
-    default_targets = "^spx,NIKKEI_OFFICIAL,fx.f,acwi.us"
+    # Regional RSI targets with labels
+    # Format: symbol or symbol:label
+    default_targets = "^spx:🇺🇸S&P500,NIKKEI_OFFICIAL:🇯🇵日経225,^dax:🇪🇺DAX,^hsi:🇨🇳ハンセン,^rts:🇷🇺RTS,acwi.us:🌍ACWI"
     targets = [s.strip() for s in os.environ.get("RSI_TARGETS", default_targets).split(",") if s.strip()]
 
     # Store DataFrames for combined output
@@ -634,15 +636,19 @@ def main() -> None:
     # ---- RSI ----
     rsi_lines: list[str] = []
     primary_rsi_df: pd.DataFrame | None = None
-    for sym in targets:
+    for target in targets:
+        # Parse symbol:label format
+        if ":" in target:
+            sym, label = target.split(":", 1)
+        else:
+            sym, label = target, target
+
         try:
-            if sym.upper() == NIKKEI_OFFICIAL_SYMBOL:
+            if sym.upper() == NIKKEI_OFFICIAL_SYMBOL or "NIKKEI" in sym.upper():
                 px = fetch_nikkei_official_daily()
-                label = "Nikkei 225 (Official)"
             else:
                 px = fetch_stooq(sym)
                 px = px.rename(columns={"Date": "date", "Close": "close"})
-                label = sym
 
             px = px[["date", "close"]].copy()
             px["date"] = pd.to_datetime(px["date"], errors="coerce")
@@ -663,9 +669,9 @@ def main() -> None:
                 primary_rsi_df = px[["date", "RSI14"]].copy()
 
             last = px.dropna(subset=["RSI14"]).iloc[-1]
-            rsi_lines.append(f"RSI {label}: {float(last['RSI14']):.1f}")
+            rsi_lines.append(f"{label}: {float(last['RSI14']):.1f}")
         except Exception as e:
-            rsi_lines.append(f"RSI {sym}: 失敗({e.__class__.__name__})")
+            rsi_lines.append(f"{label}: 失敗({e.__class__.__name__})")
 
     rsi_df = primary_rsi_df
 
@@ -851,6 +857,25 @@ def notify_only() -> None:
             try:
                 df = pd.read_csv(csv_path)
                 rsi_val = float(df.dropna(subset=["RSI14"]).iloc[-1]["RSI14"])
+            except Exception:
+                pass
+
+    # Read regional RSI values
+    regional_rsi: dict[str, float] = {}
+    rsi_files = {
+        "🇺🇸米国": "spx_rsi.csv",
+        "🇯🇵日本": "NIKKEI_OFFICIAL_rsi.csv",
+        "🇪🇺欧州": "dax_rsi.csv",
+        "🇨🇳中国": "hsi_rsi.csv",
+        "🇷🇺ロシア": "rts_rsi.csv",
+        "🌍世界": "acwi.us_rsi.csv",
+    }
+    for region, filename in rsi_files.items():
+        csv_path = os.path.join(DATA_DIR, filename)
+        if os.path.exists(csv_path):
+            try:
+                df = pd.read_csv(csv_path)
+                regional_rsi[region] = float(df.dropna(subset=["RSI14"]).iloc[-1]["RSI14"])
             except Exception:
                 pass
 
@@ -1169,6 +1194,55 @@ def notify_only() -> None:
         margin_ratio = margin_balance / 1000000  # 百万株単位
         lines.append(f"💰 信用残: {margin_ratio:.1f}M株 (買残-売残)")
         lines.append(f"   └ 高いと将来の売り圧力、低いと買い余力")
+
+    # Regional RSI comparison
+    if regional_rsi:
+        lines.extend(["", "📊 *地域別RSI*"])
+        for region, rsi_value in regional_rsi.items():
+            if rsi_value >= 70:
+                status = "🔥"
+            elif rsi_value >= 60:
+                status = "🌡️"
+            elif rsi_value <= 30:
+                status = "❄️"
+            elif rsi_value <= 40:
+                status = "🌬️"
+            else:
+                status = "➡️"
+            lines.append(f"   {region}: {rsi_value:.1f} {status}")
+
+        # Japan comparison insight
+        jp_rsi = regional_rsi.get("🇯🇵日本")
+        us_rsi = regional_rsi.get("🇺🇸米国")
+        world_rsi = regional_rsi.get("🌍世界")
+        eu_rsi = regional_rsi.get("🇪🇺欧州")
+
+        if jp_rsi and us_rsi and world_rsi:
+            lines.append("")
+            lines.append("💡 *日本 vs 世界*")
+
+            jp_vs_us = jp_rsi - us_rsi
+            jp_vs_world = jp_rsi - world_rsi
+
+            if jp_vs_us > 10:
+                lines.append(f"   🇯🇵日本は米国より過熱 (+{jp_vs_us:.0f}pt)")
+            elif jp_vs_us < -10:
+                lines.append(f"   🇯🇵日本は米国より出遅れ ({jp_vs_us:.0f}pt)")
+
+            if jp_vs_world > 10:
+                lines.append(f"   🇯🇵日本は世界平均より強い (+{jp_vs_world:.0f}pt)")
+            elif jp_vs_world < -10:
+                lines.append(f"   🇯🇵日本は世界平均より弱い ({jp_vs_world:.0f}pt)")
+
+            if abs(jp_vs_us) <= 10 and abs(jp_vs_world) <= 10:
+                lines.append("   🇯🇵日本は世界と同程度の水準")
+
+            # Highlight strongest/weakest regions
+            sorted_regions = sorted(regional_rsi.items(), key=lambda x: x[1], reverse=True)
+            strongest = sorted_regions[0]
+            weakest = sorted_regions[-1]
+            if strongest[1] - weakest[1] > 15:
+                lines.append(f"   最強: {strongest[0]} / 最弱: {weakest[0]}")
 
     message = "\n".join(lines)
     print(message)
