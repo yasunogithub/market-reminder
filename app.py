@@ -399,13 +399,75 @@ def fetch_jquants_weekly_margin(token: str) -> pd.DataFrame:
 # ---- AAII ----
 
 def fetch_aaii_from_mirror() -> pd.DataFrame:
-    url = "https://ibmetrics.com/aaii-sentiment.html"
-    tables = pd.read_html(url)
+    """Fetch AAII sentiment from official results page."""
+    import time
+    from io import StringIO
+
+    url = "https://www.aaii.com/sentimentsurvey/sent_results"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+
+    # Retry with backoff
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            r.raise_for_status()
+            break
+        except requests.HTTPError as e:
+            if attempt < 2 and e.response.status_code in (503, 429):
+                time.sleep(2 ** attempt)
+                continue
+            raise
+
+    tables = pd.read_html(StringIO(r.text))
+
     for t in tables:
-        cols = [str(c).lower() for c in t.columns]
-        if any("bull" in c for c in cols) and any("bear" in c for c in cols):
-            return t.copy()
-    raise RuntimeError("AAII mirror table not found")
+        # Check if this looks like the AAII sentiment table
+        vals = [str(v).lower() for v in t.values.flatten()[:10]]
+        if any("bullish" in v for v in vals) and any("bearish" in v for v in vals):
+            # First row is header
+            df = t.copy()
+            df.columns = df.iloc[0]
+            df = df.iloc[1:].reset_index(drop=True)
+
+            # Rename columns
+            col_map = {}
+            for c in df.columns:
+                cl = str(c).lower()
+                if "date" in cl:
+                    col_map[c] = "date"
+                elif "bull" in cl:
+                    col_map[c] = "bullish"
+                elif "neutral" in cl:
+                    col_map[c] = "neutral"
+                elif "bear" in cl:
+                    col_map[c] = "bearish"
+            df = df.rename(columns=col_map)
+
+            # Parse date (format: "Jan 28" -> need to add year)
+            if "date" in df.columns:
+                current_year = datetime.now().year
+                def parse_aaii_date(d: str) -> str:
+                    try:
+                        parsed = datetime.strptime(f"{d} {current_year}", "%b %d %Y")
+                        if parsed > datetime.now():
+                            parsed = datetime.strptime(f"{d} {current_year - 1}", "%b %d %Y")
+                        return parsed.strftime("%Y-%m-%d")
+                    except Exception:
+                        return d
+                df["date"] = df["date"].apply(parse_aaii_date)
+
+            # Convert percentages to float
+            for col in ["bullish", "neutral", "bearish"]:
+                if col in df.columns:
+                    df[col] = df[col].astype(str).str.replace("%", "").astype(float)
+
+            return df
+
+    raise RuntimeError("AAII table not found")
 
 
 def fetch_aaii_from_manual_excel(path: str) -> pd.DataFrame:
@@ -625,27 +687,32 @@ def notify_only() -> None:
     # Read latest values from combined.csv
     combined_path = os.path.join(DATA_DIR, "combined.csv")
     vix_val = "-"
+    aaii_val = "-"
     cftc_val = "-"
     if os.path.exists(combined_path):
         try:
             df = pd.read_csv(combined_path)
             df = df.dropna(subset=["date"]).sort_values("date")
-            if "vix" in df.columns:
-                last_vix = df.dropna(subset=["vix"]).iloc[-1] if df["vix"].notna().any() else None
-                if last_vix is not None:
-                    vix_val = f"{float(last_vix['vix']):.2f}"
-            if "CFTC_Net" in df.columns:
-                last_cftc = df.dropna(subset=["CFTC_Net"]).iloc[-1] if df["CFTC_Net"].notna().any() else None
-                if last_cftc is not None:
-                    cftc_val = f"{int(last_cftc['CFTC_Net']):,}"
+            if "vix" in df.columns and df["vix"].notna().any():
+                last_vix = df.dropna(subset=["vix"]).iloc[-1]
+                vix_val = f"{float(last_vix['vix']):.2f}"
+            if "AAII_Bullish" in df.columns and df["AAII_Bullish"].notna().any():
+                last_aaii = df.dropna(subset=["AAII_Bullish"]).iloc[-1]
+                bull = float(last_aaii["AAII_Bullish"])
+                bear = float(last_aaii.get("AAII_Bearish", 0)) if "AAII_Bearish" in df.columns else 0
+                aaii_val = f"Bull {bull:.1f}% / Bear {bear:.1f}%"
+            if "CFTC_Net" in df.columns and df["CFTC_Net"].notna().any():
+                last_cftc = df.dropna(subset=["CFTC_Net"]).iloc[-1]
+                cftc_val = f"{int(last_cftc['CFTC_Net']):,}"
         except Exception:
             pass
 
     lines = [
         f"Daily Market Reminder ({now_jst})",
         f"VIX: {vix_val} ({vix_key})",
-        " / ".join(rsi_lines) if rsi_lines else "RSI: -",
+        f"AAII: {aaii_val}",
         f"CFTC Net: {cftc_val}",
+        " / ".join(rsi_lines) if rsi_lines else "RSI: -",
     ]
     message = "\n".join(lines)
     print(message)
