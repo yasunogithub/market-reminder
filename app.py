@@ -478,7 +478,7 @@ def fetch_aaii_from_manual_excel(path: str) -> pd.DataFrame:
 
 
 def fetch_jpx_margin() -> pd.DataFrame:
-    """Fetch margin trading balance from JPX website (historical data)."""
+    """Fetch margin trading balance from JPX website (recent data only for speed)."""
     import io
     from datetime import timedelta
 
@@ -489,13 +489,12 @@ def fetch_jpx_margin() -> pd.DataFrame:
     results = []
     checked_dates = set()
 
-    # Try to get data for the past year
-    # Data is published weekly, check around Wednesdays and nearby dates
-    for weeks_back in range(0, 60):  # ~1 year of weekly data
+    # Only fetch recent 5 weeks for speed (data is published weekly on Wednesdays)
+    for weeks_back in range(0, 5):
         base_date = today - timedelta(weeks=weeks_back)
         
-        # Try Wednesday and surrounding days (data might be dated differently)
-        for day_offset in range(-3, 4):
+        # Try Wednesday and nearby days
+        for day_offset in range(-2, 3):
             check_date = base_date + timedelta(days=day_offset)
             date_str = check_date.strftime("%Y%m%d")
             
@@ -506,7 +505,7 @@ def fetch_jpx_margin() -> pd.DataFrame:
             url = base_url.format(date=date_str)
 
             try:
-                r = requests.get(url, headers=headers, timeout=10)
+                r = requests.get(url, headers=headers, timeout=5)
                 if r.status_code != 200:
                     continue
 
