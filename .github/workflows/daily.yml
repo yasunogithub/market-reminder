@@ -15,11 +15,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: uv pip install --system -r requirements.txt
       - name: Fetch data and generate charts
         run: python app.py
         env:
@@ -30,9 +33,9 @@ jobs:
         run: |
           git config user.name "market-bot"
           git config user.email "market-bot@users.noreply.github.com"
-          git add data charts || true
-          git commit -m "daily update" || exit 0
-          git push
+          git add -f data/*.csv data/*.json charts/*.png
+          git diff --staged --quiet || git commit -m "daily update"
+          git push || true
       - name: Send Slack notification
         run: python app.py --notify-only
         env:
