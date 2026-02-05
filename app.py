@@ -478,27 +478,40 @@ def fetch_aaii_from_manual_excel(path: str) -> pd.DataFrame:
 
 
 def fetch_jpx_margin() -> pd.DataFrame:
-    """Fetch margin trading balance from JPX website (recent data only for speed)."""
+    """Fetch margin trading balance from JPX website (incremental update)."""
     import io
     from datetime import timedelta
 
     base_url = "https://www.jpx.co.jp/markets/statistics-equities/margin/tvdivq0000001rk9-att/mtseisan{date}00.xls"
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
+    # Load existing data if available
+    existing_df = None
+    existing_dates = set()
+    csv_path = os.path.join(DATA_DIR, "margin_jpx.csv")
+    if os.path.exists(csv_path):
+        try:
+            existing_df = pd.read_csv(csv_path)
+            existing_dates = set(existing_df["date"].astype(str).tolist())
+        except Exception:
+            pass
+
     today = datetime.now()
     results = []
     checked_dates = set()
 
-    # Only fetch recent 5 weeks for speed (data is published weekly on Wednesdays)
-    for weeks_back in range(0, 5):
+    # Only fetch recent 2 weeks (data is published weekly on Wednesdays)
+    for weeks_back in range(0, 2):
         base_date = today - timedelta(weeks=weeks_back)
         
         # Try Wednesday and nearby days
         for day_offset in range(-2, 3):
             check_date = base_date + timedelta(days=day_offset)
             date_str = check_date.strftime("%Y%m%d")
+            date_key = check_date.strftime("%Y-%m-%d")
             
-            if date_str in checked_dates:
+            # Skip if already in existing data or already checked
+            if date_key in existing_dates or date_str in checked_dates:
                 continue
             checked_dates.add(date_str)
 
@@ -521,7 +534,7 @@ def fetch_jpx_margin() -> pd.DataFrame:
                             long_vol = pd.to_numeric(df.iloc[i, 5], errors="coerce")
                             if pd.notna(short_vol) and pd.notna(long_vol):
                                 results.append({
-                                    "date": check_date.strftime("%Y-%m-%d"),
+                                    "date": date_key,
                                     "margin_long": int(long_vol),
                                     "margin_short": int(short_vol),
                                     "margin_balance": int(long_vol - short_vol),
@@ -532,12 +545,21 @@ def fetch_jpx_margin() -> pd.DataFrame:
             except Exception:
                 continue
 
-    if not results:
+    # Merge with existing data
+    if results:
+        new_df = pd.DataFrame(results)
+        if existing_df is not None:
+            combined = pd.concat([existing_df, new_df], ignore_index=True)
+        else:
+            combined = new_df
+    elif existing_df is not None:
+        combined = existing_df
+    else:
         raise RuntimeError("JPX margin data not found")
 
     # Remove duplicates and sort
-    df = pd.DataFrame(results).drop_duplicates(subset=["date"]).sort_values("date")
-    return df
+    combined = combined.drop_duplicates(subset=["date"]).sort_values("date", ascending=False)
+    return combined
 
 def fetch_aaii(mode: str, manual_path: str) -> tuple[pd.DataFrame, str]:
     mode = (mode or "mirror").lower()
