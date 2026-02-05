@@ -477,25 +477,38 @@ def fetch_aaii_from_manual_excel(path: str) -> pd.DataFrame:
 
 
 def fetch_jpx_margin() -> pd.DataFrame:
-    """Fetch margin trading balance from JPX website."""
+    """Fetch margin trading balance from JPX website (historical data)."""
     import io
     from datetime import timedelta
 
     base_url = "https://www.jpx.co.jp/markets/statistics-equities/margin/tvdivq0000001rk9-att/mtseisan{date}00.xls"
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
 
-    # Try recent dates (published every Wednesday)
     today = datetime.now()
     results = []
+    checked_dates = set()
 
-    for days_back in range(0, 30):
-        check_date = today - timedelta(days=days_back)
-        date_str = check_date.strftime("%Y%m%d")
-        url = base_url.format(date=date_str)
+    # Try to get data for the past year
+    # Data is published weekly, check around Wednesdays and nearby dates
+    for weeks_back in range(0, 60):  # ~1 year of weekly data
+        base_date = today - timedelta(weeks=weeks_back)
+        
+        # Try Wednesday and surrounding days (data might be dated differently)
+        for day_offset in range(-3, 4):
+            check_date = base_date + timedelta(days=day_offset)
+            date_str = check_date.strftime("%Y%m%d")
+            
+            if date_str in checked_dates:
+                continue
+            checked_dates.add(date_str)
 
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-            if r.status_code == 200:
+            url = base_url.format(date=date_str)
+
+            try:
+                r = requests.get(url, headers=headers, timeout=10)
+                if r.status_code != 200:
+                    continue
+
                 # Parse Excel
                 df = pd.read_excel(io.BytesIO(r.content), header=None)
 
@@ -503,33 +516,28 @@ def fetch_jpx_margin() -> pd.DataFrame:
                 for i, row in df.iterrows():
                     row_str = " ".join(str(v) for v in row.values if pd.notna(v))
                     if "二市場計" in row_str or "Total" in row_str:
-                        # Next row has 株数 (shares) data
-                        if i + 1 < len(df):
-                            data_row = df.iloc[i]
-                            # Find numeric columns (売残高, 買残高)
-                            # Typically: col 3 = 売残高, col 5 = 買残高
-                            try:
-                                short_vol = pd.to_numeric(df.iloc[i, 3], errors="coerce")
-                                long_vol = pd.to_numeric(df.iloc[i, 5], errors="coerce")
-                                if pd.notna(short_vol) and pd.notna(long_vol):
-                                    results.append({
-                                        "date": check_date.strftime("%Y-%m-%d"),
-                                        "margin_long": int(long_vol),
-                                        "margin_short": int(short_vol),
-                                        "margin_balance": int(long_vol - short_vol),
-                                    })
-                                    break
-                            except Exception:
-                                pass
-                if results:
-                    break
-        except Exception:
-            continue
+                        try:
+                            short_vol = pd.to_numeric(df.iloc[i, 3], errors="coerce")
+                            long_vol = pd.to_numeric(df.iloc[i, 5], errors="coerce")
+                            if pd.notna(short_vol) and pd.notna(long_vol):
+                                results.append({
+                                    "date": check_date.strftime("%Y-%m-%d"),
+                                    "margin_long": int(long_vol),
+                                    "margin_short": int(short_vol),
+                                    "margin_balance": int(long_vol - short_vol),
+                                })
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                continue
 
     if not results:
         raise RuntimeError("JPX margin data not found")
 
-    return pd.DataFrame(results)
+    # Remove duplicates and sort
+    df = pd.DataFrame(results).drop_duplicates(subset=["date"]).sort_values("date")
+    return df
 
 def fetch_aaii(mode: str, manual_path: str) -> tuple[pd.DataFrame, str]:
     mode = (mode or "mirror").lower()
@@ -693,6 +701,79 @@ def main() -> None:
     slack_notify(slack_webhook, message, image_urls if image_urls else None)
 
 
+
+def generate_market_insights(
+    vix: float, rsi: float, cftc: int, bull: float, bear: float, margin: int
+) -> str:
+    """Generate detailed market analysis insights."""
+    insights = ["🤖 *AI Market Insights*", ""]
+    
+    # VIX analysis
+    if vix < 15:
+        insights.append("📊 *VIX分析*: 極めて低水準。市場は安心感に包まれていますが、")
+        insights.append("   コンプレイセンシー(油断)のサインかも。急変に注意。")
+    elif vix < 20:
+        insights.append("📊 *VIX分析*: 安定した水準。通常の相場環境です。")
+    elif vix < 30:
+        insights.append("📊 *VIX分析*: やや警戒水準。不安定な動きに備えを。")
+    else:
+        insights.append("📊 *VIX分析*: 高水準。恐怖が市場を支配中。")
+        insights.append("   逆張り的には買いチャンスの可能性も。")
+    
+    # RSI analysis
+    insights.append("")
+    if rsi <= 30:
+        insights.append("📈 *RSI分析*: 売られすぎ水準。反発のタイミングを探る局面。")
+        insights.append("   ただし、トレンドが強い場合はさらに下落も。")
+    elif rsi >= 70:
+        insights.append("📈 *RSI分析*: 買われすぎ水準。利確タイミングを検討。")
+        insights.append("   強いトレンドでは高止まりすることも。")
+    elif rsi >= 60:
+        insights.append("📈 *RSI分析*: やや過熱気味。上昇トレンドは継続中。")
+    elif rsi <= 40:
+        insights.append("📈 *RSI分析*: やや弱含み。下落トレンドに注意。")
+    else:
+        insights.append("📈 *RSI分析*: 中立水準。方向感を探る展開。")
+    
+    # CFTC analysis
+    insights.append("")
+    if cftc < -150000:
+        insights.append("🌊 *CFTC分析*: 投機筋の大幅売り越し。外国人売り圧力が強い。")
+        insights.append("   売り一巡後の反発に期待も、需給悪化に警戒。")
+    elif cftc < -50000:
+        insights.append("🌊 *CFTC分析*: 投機筋は売り越し基調。上値重い展開か。")
+    elif cftc > 50000:
+        insights.append("🌊 *CFTC分析*: 投機筋は買い越し。強気姿勢維持。")
+    else:
+        insights.append("🌊 *CFTC分析*: 投機筋のポジションは中立的。")
+    
+    # Sentiment analysis
+    insights.append("")
+    spread = bull - bear
+    if spread < -20:
+        insights.append("👥 *センチメント分析*: 極端な悲観。歴史的にはここが底になりやすい。")
+        insights.append("   「皆が売りたい時が買い時」の格言通りか。")
+    elif spread > 30:
+        insights.append("👥 *センチメント分析*: 過度な楽観。警戒が必要な水準。")
+        insights.append("   「皆が買いたい時が売り時」かもしれません。")
+    else:
+        insights.append("👥 *センチメント分析*: 極端なポジションなし。通常の心理状態。")
+    
+    # Margin analysis
+    if margin > 0:
+        insights.append("")
+        margin_m = margin / 1000000
+        if margin_m > 4:
+            insights.append(f"💰 *信用残分析*: {margin_m:.1f}M株は高水準。将来の売り圧力に。")
+            insights.append("   整理売りが出やすい環境。")
+        elif margin_m < 2:
+            insights.append(f"💰 *信用残分析*: {margin_m:.1f}M株は低水準。売り圧力は限定的。")
+            insights.append("   信用買い余力あり。")
+        else:
+            insights.append(f"💰 *信用残分析*: {margin_m:.1f}M株は通常水準。")
+    
+    return "\n".join(insights)
+
 def notify_only() -> None:
     """Send Slack notification using saved state (for use after commit)."""
     import json
@@ -774,6 +855,157 @@ def notify_only() -> None:
                 pass
 
     # Weather-like indicators
+
+    # Trend analysis for forecasting
+    def get_vix_trend(vix_path: str) -> tuple[str, float]:
+        """Analyze VIX trend over last 5 days."""
+        try:
+            df = pd.read_csv(vix_path)
+            df = df.dropna(subset=["vix"]).tail(5)
+            if len(df) < 2:
+                return "→", 0.0
+            change = df["vix"].iloc[-1] - df["vix"].iloc[0]
+            pct = (change / df["vix"].iloc[0]) * 100
+            if pct > 10:
+                return "↑↑", pct
+            elif pct > 3:
+                return "↑", pct
+            elif pct < -10:
+                return "↓↓", pct
+            elif pct < -3:
+                return "↓", pct
+            else:
+                return "→", pct
+        except Exception:
+            return "→", 0.0
+
+    def get_rsi_trend(csv_path: str) -> tuple[str, float]:
+        """Analyze RSI trend over last 5 days."""
+        try:
+            df = pd.read_csv(csv_path)
+            df = df.dropna(subset=["RSI14"]).tail(5)
+            if len(df) < 2:
+                return "→", 0.0
+            change = df["RSI14"].iloc[-1] - df["RSI14"].iloc[0]
+            if change > 5:
+                return "↑", change
+            elif change < -5:
+                return "↓", change
+            else:
+                return "→", change
+        except Exception:
+            return "→", 0.0
+
+    def generate_tomorrow_outlook(
+        vix: float, vix_trend: str, rsi: float, rsi_trend: str,
+        cftc: int, bull: float, bear: float
+    ) -> str:
+        """Generate tomorrow's market outlook."""
+        signals = []
+        score = 0
+
+        # VIX factor with trend
+        if vix < 20 and vix_trend in ("↓", "↓↓"):
+            signals.append("VIX低下中")
+            score += 1
+        elif vix > 25 and vix_trend in ("↑", "↑↑"):
+            signals.append("VIX上昇警戒")
+            score -= 1
+
+        # RSI factor with trend
+        if rsi < 40 and rsi_trend == "↑":
+            signals.append("売られすぎから反発")
+            score += 1
+        elif rsi > 60 and rsi_trend == "↓":
+            signals.append("過熱感解消")
+            score += 0  # neutral
+        elif rsi > 65 and rsi_trend in ("↑", "→"):
+            signals.append("過熱継続")
+            score -= 1
+
+        # Sentiment extremes (contrarian short-term signals)
+        spread = bull - bear
+        if spread < -15:
+            signals.append("悲観反発期待")
+            score += 1
+        elif spread > 25:
+            signals.append("楽観警戒")
+            score -= 1
+
+        if score >= 1:
+            outlook = "🌤️ 上向き"
+        elif score <= -1:
+            outlook = "🌧️ 軟調"
+        else:
+            outlook = "⛅ 横ばい"
+
+        return outlook, signals
+
+    def generate_weekly_outlook(
+        vix: float, vix_trend: str, rsi: float, cftc: int,
+        bull: float, bear: float, margin: int
+    ) -> str:
+        """Generate weekly market outlook."""
+        factors = []
+        score = 0
+
+        # VIX level (mean reversion)
+        if vix < 15:
+            factors.append("低VIX継続リスク")
+            score -= 1  # complacency risk
+        elif vix > 30:
+            factors.append("恐怖からの回復期待")
+            score += 1  # fear reversal
+
+        # RSI position
+        if rsi < 35:
+            factors.append("底値圏")
+            score += 1
+        elif rsi > 70:
+            factors.append("天井圏")
+            score -= 1
+
+        # CFTC positioning (contrarian for weekly)
+        if cftc < -100000:
+            factors.append("投機筋売り一巡期待")
+            score += 1
+        elif cftc > 100000:
+            factors.append("投機筋ロング過多")
+            score -= 1
+
+        # Sentiment (contrarian)
+        spread = bull - bear
+        if spread < -20:
+            factors.append("極端な悲観→反転候補")
+            score += 1
+        elif spread > 30:
+            factors.append("過度な楽観→調整候補")
+            score -= 1
+
+        # Margin pressure
+        if margin > 0:
+            margin_m = margin / 1000000
+            if margin_m > 4:
+                factors.append("信用売り圧力あり")
+                score -= 1
+
+        if score >= 2:
+            outlook = "📈 上昇基調"
+        elif score >= 1:
+            outlook = "🌤️ やや強気"
+        elif score <= -2:
+            outlook = "📉 下落警戒"
+        elif score <= -1:
+            outlook = "🌧️ やや弱気"
+        else:
+            outlook = "➡️ レンジ推移"
+
+        return outlook, factors
+
+    # Get trends
+    vix_trend, vix_change = get_vix_trend(vix_path)
+    rsi_trend, rsi_change = get_rsi_trend(os.path.join(DATA_DIR, "spx_rsi.csv"))
+
     def get_vix_weather(vix: float) -> str:
         if vix < 15:
             return "☀️ 快晴"
@@ -830,19 +1062,113 @@ def notify_only() -> None:
     rsi_indicator = get_rsi_indicator(rsi_val)
     pressure = get_external_pressure(cftc_net)
 
+    # Generate overall outlook
+    def get_outlook(vix: float, rsi: float, cftc: int, bull: float, bear: float) -> str:
+        score = 0
+        reasons = []
+        
+        # VIX factor
+        if vix < 15:
+            score += 2
+        elif vix < 20:
+            score += 1
+        elif vix > 30:
+            score -= 2
+            reasons.append("VIX高水準")
+        elif vix > 25:
+            score -= 1
+        
+        # RSI factor
+        if rsi <= 30:
+            score += 2
+            reasons.append("売られすぎ水準")
+        elif rsi <= 40:
+            score += 1
+        elif rsi >= 70:
+            score -= 2
+            reasons.append("過熱感")
+        elif rsi >= 60:
+            score -= 1
+        
+        # CFTC factor
+        if cftc < -100000:
+            score -= 1
+            reasons.append("海外勢売り越し")
+        elif cftc > 50000:
+            score += 1
+        
+        # Sentiment factor (contrarian)
+        spread = bull - bear
+        if spread < -20:
+            score += 1
+            reasons.append("悲観極まり")
+        elif spread > 30:
+            score -= 1
+            reasons.append("楽観過ぎ")
+        
+        if score >= 2:
+            outlook = "📈 上昇期待"
+        elif score >= 1:
+            outlook = "↗️ やや上目線"
+        elif score <= -2:
+            outlook = "📉 下落警戒"
+        elif score <= -1:
+            outlook = "↘️ やや下目線"
+        else:
+            outlook = "➡️ 様子見"
+        
+        return outlook, reasons
+
+    outlook, reasons = get_outlook(vix_val, rsi_val, cftc_net, aaii_bull, aaii_bear)
+
+    # Generate tomorrow and weekly outlooks
+    tomorrow_outlook, tomorrow_signals = generate_tomorrow_outlook(
+        vix_val, vix_trend, rsi_val, rsi_trend, cftc_net, aaii_bull, aaii_bear
+    )
+    weekly_outlook, weekly_factors = generate_weekly_outlook(
+        vix_val, vix_trend, rsi_val, cftc_net, aaii_bull, aaii_bear, margin_balance
+    )
+
     lines = [
         "<!here>",
         f"📊 マーケット天気予報 ({now_jst})",
         "",
-        f"🌡️ VIX: {vix_val:.1f} → {vix_weather}",
-        f"👥 センチメント: {sentiment} (強気{aaii_bull:.0f}%/弱気{aaii_bear:.0f}%)",
-        f"📈 RSI: {rsi_val:.1f} → {rsi_indicator}",
-        f"🌊 CFTC: {cftc_net:,} → {pressure}",
+        f"🎯 総合判断: {outlook}",
     ]
+    
+    if reasons:
+        lines.append(f"   └ {', '.join(reasons)}")
+
+    # Add tomorrow and weekly outlook
+    lines.extend([
+        "",
+        f"📅 *明日の見通し*: {tomorrow_outlook}",
+    ])
+    if tomorrow_signals:
+        lines.append(f"   └ {', '.join(tomorrow_signals)}")
+
+    lines.extend([
+        f"📆 *今後1週間*: {weekly_outlook}",
+    ])
+    if weekly_factors:
+        lines.append(f"   └ {', '.join(weekly_factors)}")
+    
+    lines.extend([
+        "",
+        f"🌡️ VIX: {vix_val:.1f} → {vix_weather}",
+        f"   └ 恐怖指数。20以下は安心、30超は警戒",
+        f"👥 センチメント: {sentiment} (強気{aaii_bull:.0f}%/弱気{aaii_bear:.0f}%)",
+        f"   └ 個人投資家心理。逆張り指標として有効",
+        f"📈 RSI: {rsi_val:.1f} → {rsi_indicator}",
+        f"   └ 70超=買われすぎ、30未満=売られすぎ",
+        f"🌊 CFTC: {cftc_net:,} → {pressure}",
+        f"   └ 海外投機筋のポジション。マイナス=売り越し",
+    ])
 
     if margin_balance > 0:
         margin_ratio = margin_balance / 1000000  # 百万株単位
-        lines.append(f"💰 信用残: {margin_ratio:.1f}M株")
+        lines.append(f"💰 信用残: {margin_ratio:.1f}M株 (買残-売残)")
+        lines.append(f"   └ 高いと将来の売り圧力、低いと買い余力")
 
     message = "\n".join(lines)
     print(message)
@@ -855,6 +1181,11 @@ def notify_only() -> None:
         ]
 
     slack_notify(slack_webhook, message, image_urls if image_urls else None)
+
+    # Send detailed AI insights as follow-up
+    insights = generate_market_insights(vix_val, rsi_val, cftc_net, aaii_bull, aaii_bear, margin_balance)
+    if insights:
+        slack_notify(slack_webhook, insights)
 
 
 if __name__ == "__main__":
