@@ -601,7 +601,8 @@ def main() -> None:
     # Regional RSI targets with labels
     # Format: symbol or symbol:label
     default_targets = "^spx:🇺🇸S&P500,NIKKEI_OFFICIAL:🇯🇵日経225,^dax:🇪🇺DAX,^hsi:🇨🇳ハンセン,^rts:🇷🇺RTS,acwi.us:🌍ACWI"
-    targets = [s.strip() for s in os.environ.get("RSI_TARGETS", default_targets).split(",") if s.strip()]
+    targets_str = os.environ.get("RSI_TARGETS") or default_targets  # Handle empty string
+    targets = [s.strip() for s in targets_str.split(",") if s.strip()]
 
     # Store DataFrames for combined output
     vix_df: pd.DataFrame | None = None
