@@ -385,15 +385,14 @@ def fetch_nikkei_official_daily() -> pd.DataFrame:
 
 # ---- J-Quants (weekly margin balance) ----
 
-def fetch_jquants_weekly_margin(token: str) -> pd.DataFrame:
-    api_url = os.environ.get("JQUANTS_MARGIN_API_URL", "")
-    if not api_url:
-        raise RuntimeError("JQUANTS_MARGIN_API_URL is not set")
-    headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(api_url, headers=headers, timeout=30)
+def fetch_jquants_weekly_margin(api_key: str) -> pd.DataFrame:
+    """Fetch weekly margin data from J-Quants V2 API."""
+    url = "https://api.jquants.com/v2/markets/weekly_margin_interest"
+    headers = {"x-api-key": api_key}
+    r = requests.get(url, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
-    return pd.DataFrame(data.get("data", data))
+    return pd.DataFrame(data.get("weekly_margin_interest", data.get("data", [])))
 
 
 # ---- AAII ----
@@ -541,10 +540,10 @@ def main() -> None:
     # ---- J-Quants weekly margin ----
     margin_updated = False
     margin_note = "信用残: 未設定"
-    j_token = os.environ.get("JQUANTS_TOKEN", "")
-    if j_token and os.environ.get("JQUANTS_MARGIN_API_URL", ""):
+    j_api_key = os.environ.get("JQUANTS_API_KEY", "")
+    if j_api_key:
         try:
-            margin_df = fetch_jquants_weekly_margin(j_token)
+            margin_df = fetch_jquants_weekly_margin(j_api_key)
             save_csv(margin_df, os.path.join(DATA_DIR, "margin_weekly.csv"))
             key = str(len(margin_df))
             for cand in ["Date", "date", "EndDate", "end_date", "TradeDate", "trade_date"]:

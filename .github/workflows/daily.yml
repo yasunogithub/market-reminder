@@ -23,8 +23,7 @@ jobs:
           AAII_MODE: ${{ secrets.AAII_MODE }}
           AAII_MANUAL_FILE: ${{ secrets.AAII_MANUAL_FILE }}
           RSI_TARGETS: ${{ secrets.RSI_TARGETS }}
-          JQUANTS_TOKEN: ${{ secrets.JQUANTS_TOKEN }}
-          JQUANTS_MARGIN_API_URL: ${{ secrets.JQUANTS_MARGIN_API_URL }}
+          JQUANTS_API_KEY: ${{ secrets.JQUANTS_API_KEY }}
       - name: Commit outputs
         run: |
           git config user.name "market-bot"
