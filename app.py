@@ -879,6 +879,15 @@ def notify_only() -> None:
             except Exception:
                 pass
 
+    # Read USD/JPY for Japan analysis
+    usdjpy = 0.0
+    try:
+        usdjpy_df = fetch_stooq("usdjpy")
+        if not usdjpy_df.empty and "Close" in usdjpy_df.columns:
+            usdjpy = float(usdjpy_df.iloc[-1]["Close"])
+    except Exception:
+        pass
+
     # Weather-like indicators
 
     # Trend analysis for forecasting
@@ -1243,6 +1252,30 @@ def notify_only() -> None:
             weakest = sorted_regions[-1]
             if strongest[1] - weakest[1] > 15:
                 lines.append(f"   最強: {strongest[0]} / 最弱: {weakest[0]}")
+
+            # Japan structural analysis
+            if jp_rsi and jp_rsi > 55 and (usdjpy > 140 or cftc_net < -50000):
+                lines.append("")
+                lines.append("⚠️ *日本市場の注意点*")
+
+                warnings = []
+
+                # Yen weakness analysis
+                if usdjpy > 145:
+                    lines.append(f"   💴 円安 {usdjpy:.0f}円 → 円建て利益膨張")
+                    warnings.append("ドル建てでは米国株に劣後")
+
+                # Foreign selling pressure
+                if cftc_net < -100000:
+                    lines.append(f"   🌊 外国人売り {cftc_net:,} → 海外勢は弱気")
+                    warnings.append("国内勢が支えている構図")
+                elif cftc_net < -50000:
+                    lines.append(f"   🌊 CFTC {cftc_net:,} → 外圧あり")
+
+                # Structural conclusion
+                if usdjpy > 140 and cftc_net < -50000:
+                    lines.append("   📊 結論: 「円安効果+国内フロー」による強さ")
+                    lines.append("   → 外圧顕在化で調整リスクあり")
 
     message = "\n".join(lines)
     print(message)
