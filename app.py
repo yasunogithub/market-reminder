@@ -2,6 +2,7 @@ import io
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -588,39 +589,98 @@ def main() -> None:
     margin_df: pd.DataFrame | None = None
     rsi_df: pd.DataFrame | None = None
 
-    # ---- VIX ----
-    vix_df = fetch_vix_fred()
-    save_csv(vix_df, os.path.join(DATA_DIR, "vix.csv"))
-    save_line_chart(vix_df, "date", "vix", "VIX (FRED VIXCLS)", os.path.join(CHART_DIR, "vix.png"))
-    vix_dates = pd.to_datetime(vix_df["date"], errors="coerce")
-    vix_max = vix_dates.max()
+    # ---- Parallel data fetching ----
+    def fetch_task_vix():
+        return ("vix", fetch_vix_fred())
+
+    def fetch_task_cftc():
+        return ("cftc", fetch_cftc_finfutwk())
+
+    def fetch_task_margin():
+        try:
+            return ("margin", fetch_jpx_margin())
+        except Exception as e:
+            return ("margin", e)
+
+    def fetch_task_aaii():
+        try:
+            return ("aaii", fetch_aaii(aaii_mode, aaii_manual_file))
+        except Exception as e:
+            return ("aaii", e)
+
+    def fetch_task_rsi(target: str):
+        if ":" in target:
+            sym, label = target.split(":", 1)
+        else:
+            sym, label = target, target
+        try:
+            if sym.upper() == NIKKEI_OFFICIAL_SYMBOL or "NIKKEI" in sym.upper():
+                px = fetch_nikkei_official_daily()
+            else:
+                px = fetch_stooq(sym)
+                px = px.rename(columns={"Date": "date", "Close": "close"})
+            return ("rsi", sym, label, px)
+        except Exception as e:
+            return ("rsi", sym, label, e)
+
+    # Run all fetches in parallel
+    results = {}
+    rsi_results = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [
+            executor.submit(fetch_task_vix),
+            executor.submit(fetch_task_cftc),
+            executor.submit(fetch_task_margin),
+            executor.submit(fetch_task_aaii),
+        ]
+        # Add RSI targets
+        for t in targets:
+            futures.append(executor.submit(fetch_task_rsi, t))
+
+        for future in as_completed(futures):
+            result = future.result()
+            if result[0] == "rsi":
+                rsi_results.append(result)
+            else:
+                results[result[0]] = result[1]
+
+    # ---- Process VIX ----
+    vix_df = results.get("vix")
+    if vix_df is not None:
+        save_csv(vix_df, os.path.join(DATA_DIR, "vix.csv"))
+        save_line_chart(vix_df, "date", "vix", "VIX (FRED VIXCLS)", os.path.join(CHART_DIR, "vix.png"))
+    vix_dates = pd.to_datetime(vix_df["date"], errors="coerce") if vix_df is not None else pd.Series()
+    vix_max = vix_dates.max() if not vix_dates.empty else None
     vix_key = str(vix_max.date()) if pd.notna(vix_max) else "unknown"
     vix_updated = changed_since_last_run("vix", vix_key)
 
-    # ---- CFTC ----
-    cftc_df = fetch_cftc_finfutwk()
-    save_csv(cftc_df, os.path.join(DATA_DIR, "cftc_finfutwk_raw.csv"))
-    cftc_key = str(len(cftc_df))
+    # ---- Process CFTC ----
+    cftc_df = results.get("cftc")
+    if cftc_df is not None:
+        save_csv(cftc_df, os.path.join(DATA_DIR, "cftc_finfutwk_raw.csv"))
+    cftc_key = str(len(cftc_df)) if cftc_df is not None else "0"
     cftc_updated = changed_since_last_run("cftc", cftc_key)
 
-    # ---- J-Quants weekly margin ----
+    # ---- Process Margin ----
     margin_updated = False
     margin_note = "信用残: -"
-    try:
-        margin_df = fetch_jpx_margin()
+    margin_result = results.get("margin")
+    if isinstance(margin_result, pd.DataFrame):
+        margin_df = margin_result
         save_csv(margin_df, os.path.join(DATA_DIR, "margin_jpx.csv"))
         if "date" in margin_df.columns:
             key = str(margin_df["date"].iloc[0])
             margin_updated = changed_since_last_run("margin", key)
             margin_note = f"信用残: {'更新あり' if margin_updated else '更新なし'} ({key})"
-    except Exception as e:
-        margin_note = f"信用残: 取得失敗 ({e.__class__.__name__})"
+    elif isinstance(margin_result, Exception):
+        margin_note = f"信用残: 取得失敗 ({margin_result.__class__.__name__})"
 
-    # ---- AAII ----
+    # ---- Process AAII ----
     aaii_updated = False
     aaii_note = "AAII: 未取得"
-    try:
-        aaii_df, aaii_source = fetch_aaii(aaii_mode, aaii_manual_file)
+    aaii_result = results.get("aaii")
+    if isinstance(aaii_result, tuple):
+        aaii_df, aaii_source = aaii_result
         save_csv(aaii_df, os.path.join(DATA_DIR, "aaii.csv"))
         key = str(len(aaii_df))
         for cand in aaii_df.columns:
@@ -630,26 +690,24 @@ def main() -> None:
                 break
         aaii_updated = changed_since_last_run("aaii", key)
         aaii_note = f"AAII({aaii_source}): {'更新あり' if aaii_updated else '更新なし'} ({key})"
-    except Exception as e:
-        aaii_note = f"AAII: 取得失敗 ({e.__class__.__name__})"
+    elif isinstance(aaii_result, Exception):
+        aaii_note = f"AAII: 取得失敗 ({aaii_result.__class__.__name__})"
 
-    # ---- RSI ----
+    # ---- Process RSI (maintain order) ----
     rsi_lines: list[str] = []
     primary_rsi_df: pd.DataFrame | None = None
-    for target in targets:
-        # Parse symbol:label format
-        if ":" in target:
-            sym, label = target.split(":", 1)
-        else:
-            sym, label = target, target
+    # Sort by original target order
+    target_order = {t.split(":")[0] if ":" in t else t: i for i, t in enumerate(targets)}
+    rsi_results.sort(key=lambda x: target_order.get(x[1], 999))
+
+    for result in rsi_results:
+        _, sym, label, data = result
+        if isinstance(data, Exception):
+            rsi_lines.append(f"{label}: 失敗({data.__class__.__name__})")
+            continue
 
         try:
-            if sym.upper() == NIKKEI_OFFICIAL_SYMBOL or "NIKKEI" in sym.upper():
-                px = fetch_nikkei_official_daily()
-            else:
-                px = fetch_stooq(sym)
-                px = px.rename(columns={"Date": "date", "Close": "close"})
-
+            px = data
             px = px[["date", "close"]].copy()
             px["date"] = pd.to_datetime(px["date"], errors="coerce")
             px["close"] = pd.to_numeric(
