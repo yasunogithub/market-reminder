@@ -2,10 +2,12 @@ import io
 import json
 import os
 import re
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pdfplumber
 import requests
 
 import matplotlib
@@ -561,6 +563,91 @@ def fetch_jpx_margin() -> pd.DataFrame:
     combined = combined.drop_duplicates(subset=["date"]).sort_values("date", ascending=False)
     return combined
 
+def fetch_oil_stockpile() -> pd.DataFrame:
+    """Fetch Japan oil stockpile data (speed report) from METI/ENECHO.
+
+    Scrapes the statistics page to find the latest speed-report PDF,
+    downloads it, and extracts stockpile days for each category.
+    Returns a DataFrame with columns:
+        date, national, private, joint, total
+    """
+    base = "https://www.enecho.meti.go.jp"
+    index_url = base + "/statistics/petroleum_and_lpgas/pl001/"
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    r = requests.get(index_url, headers=headers, timeout=30)
+    r.raise_for_status()
+    m = re.search(r'href=["\']([^"\']*pdf-oil-res/[^"\']+\.pdf)', r.text)
+    if not m:
+        raise RuntimeError("Oil stockpile speed-report PDF link not found")
+    pdf_path = m.group(1)
+    if not pdf_path.startswith("http"):
+        pdf_path = base + pdf_path
+
+    pr = requests.get(pdf_path, headers=headers, timeout=30)
+    pr.raise_for_status()
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+        tmp.write(pr.content)
+        tmp.flush()
+        with pdfplumber.open(tmp.name) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    # Normalize full-width digits to half-width
+    text = text.translate(str.maketrans("０１２３４５６７８９", "0123456789"))
+
+    rows: list[dict] = []
+    # Split into blocks by date header: 令和N年M月D日（M月D日時点）
+    blocks = re.split(r"(令和\d+年\d+月\s*\d+日)", text)
+    for i in range(1, len(blocks), 2):
+        date_header = blocks[i]
+        body = blocks[i + 1] if i + 1 < len(blocks) else ""
+
+        # Parse date from header (令和8年4月3日 -> 2026-04-03)
+        dm = re.search(r"令和(\d+)年(\d+)月\s*(\d+)日", date_header)
+        if not dm:
+            continue
+        year = int(dm.group(1)) + 2018
+        month = int(dm.group(2))
+        day = int(dm.group(3))
+        date_str = f"{year}-{month:02d}-{day:02d}"
+
+        # Extract stockpile days
+        national = _extract_days(body, r"国家備蓄\s*(\d+)")
+        private = _extract_days(body, r"民間備蓄\s*(\d+)")
+        joint = _extract_days(body, r"産油国共同備蓄\s*(\d+)")
+        total = _extract_days(body, r"合計\s*(\d+)")
+        if total is None:
+            continue
+
+        rows.append({
+            "date": date_str,
+            "national": national,
+            "private": private,
+            "joint": joint,
+            "total": total,
+        })
+
+    if not rows:
+        raise RuntimeError("Failed to parse oil stockpile data from PDF")
+
+    df = pd.DataFrame(rows)
+    # Merge with existing data if present
+    csv_path = os.path.join(DATA_DIR, "oil_stockpile.csv")
+    if os.path.exists(csv_path):
+        old = pd.read_csv(csv_path, dtype=str)
+        df = pd.concat([old, df], ignore_index=True)
+        df = df.drop_duplicates(subset=["date"], keep="last")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_values("date", ascending=False).reset_index(drop=True)
+    return df
+
+
+def _extract_days(text: str, pattern: str) -> int | None:
+    m = re.search(pattern, text)
+    return int(m.group(1)) if m else None
+
+
 def fetch_aaii(mode: str, manual_path: str) -> tuple[pd.DataFrame, str]:
     mode = (mode or "mirror").lower()
     if mode == "mirror":
@@ -610,6 +697,7 @@ def main() -> None:
     cftc_df: pd.DataFrame | None = None
     margin_df: pd.DataFrame | None = None
     rsi_df: pd.DataFrame | None = None
+    oil_stockpile_df: pd.DataFrame | None = None
 
     # ---- Parallel data fetching ----
     def fetch_task_vix():
@@ -629,6 +717,12 @@ def main() -> None:
             return ("aaii", fetch_aaii(aaii_mode, aaii_manual_file))
         except Exception as e:
             return ("aaii", e)
+
+    def fetch_task_oil_stockpile():
+        try:
+            return ("oil_stockpile", fetch_oil_stockpile())
+        except Exception as e:
+            return ("oil_stockpile", e)
 
     def fetch_task_rsi(target: str):
         if ":" in target:
@@ -654,6 +748,7 @@ def main() -> None:
             executor.submit(fetch_task_cftc),
             executor.submit(fetch_task_margin),
             executor.submit(fetch_task_aaii),
+            executor.submit(fetch_task_oil_stockpile),
         ]
         # Add RSI targets
         for t in targets:
@@ -715,6 +810,29 @@ def main() -> None:
     elif isinstance(aaii_result, Exception):
         aaii_note = f"AAII: 取得失敗 ({aaii_result.__class__.__name__})"
 
+    # ---- Process Oil Stockpile ----
+    oil_updated = False
+    oil_note = "石油備蓄: 未取得"
+    oil_result = results.get("oil_stockpile")
+    if isinstance(oil_result, pd.DataFrame):
+        oil_stockpile_df = oil_result
+        save_csv(oil_stockpile_df, os.path.join(DATA_DIR, "oil_stockpile.csv"))
+        save_line_chart(
+            oil_stockpile_df, "date", "total",
+            "Japan Oil Stockpile (days)",
+            os.path.join(CHART_DIR, "oil_stockpile.png"),
+        )
+        latest = oil_stockpile_df.iloc[0]
+        key = str(latest["date"])[:10]
+        oil_updated = changed_since_last_run("oil_stockpile", key)
+        oil_note = (
+            f"石油備蓄: {'更新あり' if oil_updated else '更新なし'} ({key}) "
+            f"合計{int(latest['total'])}日 "
+            f"(国家{int(latest['national'])} / 民間{int(latest['private'])} / 共同{int(latest['joint'])})"
+        )
+    elif isinstance(oil_result, Exception):
+        oil_note = f"石油備蓄: 取得失敗 ({oil_result.__class__.__name__})"
+
     # ---- Process RSI (maintain order) ----
     rsi_lines: list[str] = []
     primary_rsi_df: pd.DataFrame | None = None
@@ -770,6 +888,7 @@ def main() -> None:
         aaii_note,
         f"CFTC: {'更新あり' if cftc_updated else '更新なし'}",
         margin_note,
+        oil_note,
         " / ".join(rsi_lines) if rsi_lines else "RSI: なし",
         "",
         "出力: data/*.csv, charts/*.png",
