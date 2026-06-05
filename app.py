@@ -202,12 +202,17 @@ def build_combined_df(
     # CFTC - use pre-extracted S&P 500 net position
     merge_col(cftc_sp500, "CFTC_Net", "CFTC_Net")
 
-    # Margin
+    # Margin (信用取引現在高): 買残合計を Margin、売残合計を Margin_Short として保持
     if margin_df is not None:
-        for c in margin_df.columns:
-            if "margin" in str(c).lower() or "balance" in str(c).lower():
-                merge_col(margin_df, c, "Margin")
-                break
+        if "margin_long_total" in margin_df.columns:
+            merge_col(margin_df, "margin_long_total", "Margin")
+            merge_col(margin_df, "margin_short_total", "Margin_Short")
+        else:
+            # 旧スキーマ後方互換
+            for c in margin_df.columns:
+                if "margin" in str(c).lower() or "balance" in str(c).lower():
+                    merge_col(margin_df, c, "Margin")
+                    break
 
     # RSI
     if rsi_df is not None:
@@ -479,89 +484,93 @@ def fetch_aaii_from_manual_excel(path: str) -> pd.DataFrame:
 
 
 
-def fetch_jpx_margin() -> pd.DataFrame:
-    """Fetch margin trading balance from JPX website (incremental update)."""
-    import io
-    from datetime import timedelta
+JPX_BASE = "https://www.jpx.co.jp"
+JPX_MARGIN_TREND_PAGE = f"{JPX_BASE}/markets/statistics-equities/margin/06.html"
 
-    base_url = "https://www.jpx.co.jp/markets/statistics-equities/margin/tvdivq0000001rk9-att/mtseisan{date}00.xls"
+
+def _find_jpx_margin_trend_url() -> str:
+    """Scrape JPX page 06 (信用取引現在高 過去推移表) for the 委託/自己/合計 Excel link.
+
+    The filename is a rotating hash, so we resolve it from the page each run.
+    Two trend tables are listed:
+      - 信用取引現在高（一般信用取引・制度信用取引別)  -> general/standardized breakdown (skip)
+      - 信用取引現在高                                  -> 委託/自己/合計 breakdown (use this)
+    """
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    r = requests.get(JPX_MARGIN_TREND_PAGE, headers=headers, timeout=15)
+    r.raise_for_status()
+    html = r.text
 
-    # Load existing data if available
-    existing_df = None
-    existing_dates = set()
-    csv_path = os.path.join(DATA_DIR, "margin_jpx.csv")
-    if os.path.exists(csv_path):
+    candidates = []  # (row_text, url)
+    for m in re.finditer(r"<tr.*?</tr>", html, re.S):
+        block = m.group(0)
+        if "rq1-att" not in block or ".xls" not in block:
+            continue
+        link = re.search(r'href="([^"]*rq1-att/[^"]*\.xls)"', block)
+        if not link:
+            continue
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", block)).strip()
+        candidates.append((text, link.group(1)))
+
+    for text, url in candidates:
+        if "信用取引現在高" in text and "一般信用取引" not in text:
+            return JPX_BASE + url
+    if candidates:
+        return JPX_BASE + candidates[-1][1]
+    raise RuntimeError("JPX margin trend Excel link not found on 06.html")
+
+
+def fetch_jpx_margin(weeks: int = 12) -> pd.DataFrame:
+    """Fetch margin (信用取引現在高) short/long balance from JPX official trend table.
+
+    Source: 信用取引残高等 > 信用取引現在高 過去推移表 (委託/自己/合計).
+    The Excel holds weekly history back to 2002; we keep the most recent `weeks`.
+
+    Columns (二市場合計, 申込日基準, 単位: 千株):
+      0=月日, 1=委託売残高(株), 3=委託買残高(株),
+      9=合計売残高(株), 11=合計買残高(株)
+
+    Returned schema:
+      date, margin_short_total (合計売残), margin_long_total (合計買残),
+      margin_short_customer (委託売残), margin_ratio (買残/売残, 信用倍率)
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
+    url = _find_jpx_margin_trend_url()
+
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    df = pd.read_excel(io.BytesIO(r.content), header=None)
+
+    rows = []
+    for i in range(len(df)):
+        d = df.iloc[i, 0]
+        # Data rows have a real date in col 0; header/footer rows are text or NaN.
+        if isinstance(d, str) or pd.isna(d):
+            continue
         try:
-            existing_df = pd.read_csv(csv_path)
-            existing_dates = set(existing_df["date"].astype(str).tolist())
+            date = pd.to_datetime(d)
         except Exception:
-            pass
+            continue
 
-    today = datetime.now()
-    results = []
-    checked_dates = set()
+        short_total = pd.to_numeric(df.iloc[i, 9], errors="coerce")
+        long_total = pd.to_numeric(df.iloc[i, 11], errors="coerce")
+        short_cust = pd.to_numeric(df.iloc[i, 1], errors="coerce")
+        if pd.isna(short_total) or pd.isna(long_total):
+            continue
 
-    # Only fetch recent 2 weeks (data is published weekly on Wednesdays)
-    for weeks_back in range(0, 2):
-        base_date = today - timedelta(weeks=weeks_back)
-        
-        # Try Wednesday and nearby days
-        for day_offset in range(-2, 3):
-            check_date = base_date + timedelta(days=day_offset)
-            date_str = check_date.strftime("%Y%m%d")
-            date_key = check_date.strftime("%Y-%m-%d")
-            
-            # Skip if already in existing data or already checked
-            if date_key in existing_dates or date_str in checked_dates:
-                continue
-            checked_dates.add(date_str)
+        rows.append({
+            "date": date.strftime("%Y-%m-%d"),
+            "margin_short_total": int(short_total),
+            "margin_long_total": int(long_total),
+            "margin_short_customer": int(short_cust) if pd.notna(short_cust) else None,
+            "margin_ratio": round(float(long_total) / float(short_total), 2) if short_total else None,
+        })
 
-            url = base_url.format(date=date_str)
+    if not rows:
+        raise RuntimeError("JPX margin data not found in trend Excel")
 
-            try:
-                r = requests.get(url, headers=headers, timeout=5)
-                if r.status_code != 200:
-                    continue
-
-                # Parse Excel
-                df = pd.read_excel(io.BytesIO(r.content), header=None)
-
-                # Find the row with "二市場計" (Total)
-                for i, row in df.iterrows():
-                    row_str = " ".join(str(v) for v in row.values if pd.notna(v))
-                    if "二市場計" in row_str or "Total" in row_str:
-                        try:
-                            short_vol = pd.to_numeric(df.iloc[i, 3], errors="coerce")
-                            long_vol = pd.to_numeric(df.iloc[i, 5], errors="coerce")
-                            if pd.notna(short_vol) and pd.notna(long_vol):
-                                results.append({
-                                    "date": date_key,
-                                    "margin_long": int(long_vol),
-                                    "margin_short": int(short_vol),
-                                    "margin_balance": int(long_vol - short_vol),
-                                })
-                                break
-                        except Exception:
-                            pass
-            except Exception:
-                continue
-
-    # Merge with existing data
-    if results:
-        new_df = pd.DataFrame(results)
-        if existing_df is not None:
-            combined = pd.concat([existing_df, new_df], ignore_index=True)
-        else:
-            combined = new_df
-    elif existing_df is not None:
-        combined = existing_df
-    else:
-        raise RuntimeError("JPX margin data not found")
-
-    # Remove duplicates and sort
-    combined = combined.drop_duplicates(subset=["date"]).sort_values("date", ascending=False)
-    return combined
+    out = pd.DataFrame(rows).drop_duplicates(subset=["date"]).sort_values("date", ascending=False)
+    return out.head(weeks).reset_index(drop=True)
 
 def fetch_oil_stockpile() -> pd.DataFrame:
     """Fetch Japan oil stockpile data (speed report) from METI/ENECHO.
@@ -778,19 +787,27 @@ def main() -> None:
     cftc_key = str(len(cftc_df)) if cftc_df is not None else "0"
     cftc_updated = changed_since_last_run("cftc", cftc_key)
 
-    # ---- Process Margin ----
+    # ---- Process Margin (信用取引現在高: 売り残/買い残) ----
     margin_updated = False
-    margin_note = "信用残: -"
+    margin_note = "信用売り残: -"
     margin_result = results.get("margin")
     if isinstance(margin_result, pd.DataFrame):
         margin_df = margin_result
         save_csv(margin_df, os.path.join(DATA_DIR, "margin_jpx.csv"))
-        if "date" in margin_df.columns:
-            key = str(margin_df["date"].iloc[0])
+        if "date" in margin_df.columns and not margin_df.empty:
+            latest = margin_df.iloc[0]
+            key = str(latest["date"])
             margin_updated = changed_since_last_run("margin", key)
-            margin_note = f"信用残: {'更新あり' if margin_updated else '更新なし'} ({key})"
+            short_m = int(latest["margin_short_total"]) / 1000  # 千株 -> 百万株
+            long_m = int(latest["margin_long_total"]) / 1000
+            ratio = latest.get("margin_ratio")
+            ratio_str = f", 信用倍率{float(ratio):.2f}倍" if pd.notna(ratio) else ""
+            margin_note = (
+                f"信用売り残: {'更新あり' if margin_updated else '更新なし'} ({key}) "
+                f"売残{short_m:.1f}M株 / 買残{long_m:.1f}M株{ratio_str}"
+            )
     elif isinstance(margin_result, Exception):
-        margin_note = f"信用残: 取得失敗 ({margin_result.__class__.__name__})"
+        margin_note = f"信用売り残: 取得失敗 ({margin_result.__class__.__name__})"
 
     # ---- Process AAII ----
     aaii_updated = False
@@ -1040,12 +1057,27 @@ def notify_only() -> None:
         except Exception:
             pass
 
-    # Margin
+    # Margin (信用取引現在高: 売り残/買い残)
+    margin_short_total = 0   # 合計売残 (千株)
+    margin_long_total = 0    # 合計買残 (千株)
+    margin_ratio = 0.0       # 信用倍率 (買残/売残)
+    margin_date = ""
     margin_path = os.path.join(DATA_DIR, "margin_jpx.csv")
     if os.path.exists(margin_path):
         try:
             df = pd.read_csv(margin_path)
-            margin_balance = int(df.iloc[0].get("margin_balance", 0))
+            row = df.iloc[0]  # 最新が先頭
+            if "margin_long_total" in df.columns:
+                margin_short_total = int(row.get("margin_short_total", 0) or 0)
+                margin_long_total = int(row.get("margin_long_total", 0) or 0)
+                margin_ratio = float(row.get("margin_ratio", 0) or 0)
+                margin_date = str(row.get("date", ""))[:10]
+            else:
+                # 旧スキーマ後方互換
+                margin_long_total = int(row.get("margin_long", 0) or 0)
+                margin_short_total = int(row.get("margin_short", 0) or 0)
+            # weekly_outlook / insights は買残合計を「信用残」として扱う (後方互換)
+            margin_balance = margin_long_total
         except Exception:
             pass
 
@@ -1398,10 +1430,14 @@ def notify_only() -> None:
         f"   └ 海外投機筋のポジション。マイナス=売り越し",
     ])
 
-    if margin_balance > 0:
-        margin_ratio = margin_balance / 1000000  # 百万株単位
-        lines.append(f"💰 信用残: {margin_ratio:.1f}M株 (買残-売残)")
-        lines.append(f"   └ 高いと将来の売り圧力、低いと買い余力")
+    if margin_short_total > 0:
+        short_m = margin_short_total / 1000  # 千株 -> 百万株
+        long_m = margin_long_total / 1000
+        ratio_str = f" / 信用倍率{margin_ratio:.2f}倍" if margin_ratio > 0 else ""
+        date_str = f" ({margin_date})" if margin_date else ""
+        lines.append(f"💰 信用売り残: {short_m:.1f}M株{date_str}")
+        lines.append(f"   └ 買残{long_m:.1f}M株{ratio_str}")
+        lines.append(f"   └ 売残=将来の買い戻し需要、信用倍率↑で需給悪化")
 
     # Regional RSI comparison
     if regional_rsi:
